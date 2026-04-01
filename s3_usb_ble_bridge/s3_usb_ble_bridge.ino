@@ -174,6 +174,13 @@ static volatile bool     mouseDirty = false;
 static unsigned long     lastMouseNotify = 0;
 #define BLE_MOUSE_INTERVAL_MS  8  // ~125Hz BLE notify rate
 
+// ─── Cursor Smoothing ─────────────────────────────────────────
+// Send a fraction of accumulated delta each frame, carry remainder.
+// Lower = smoother but more latency. 0.7~0.85 recommended.
+#define SMOOTHING_FACTOR  0.75f
+static float smoothRemainX = 0;
+static float smoothRemainY = 0;
+
 // ─── USB Host Globals ─────────────────────────────────────────
 static usb_host_client_handle_t clientHandle = NULL;
 static uint8_t                  usbDevAddr   = 0;
@@ -302,8 +309,24 @@ static void dispatchHidReport(uint8_t ifaceIdx,
       prevBtn = btn;
 
       if (btnChanged || (now - lastMouseNotify >= BLE_MOUSE_INTERVAL_MS)) {
-        int16_t sendX = (accumX > 32767) ? 32767 : (accumX < -32768) ? -32768 : (int16_t)accumX;
-        int16_t sendY = (accumY > 32767) ? 32767 : (accumY < -32768) ? -32768 : (int16_t)accumY;
+        // Apply smoothing: send a fraction, carry remainder
+        float totalX = (float)accumX + smoothRemainX;
+        float totalY = (float)accumY + smoothRemainY;
+
+        float sendFX = totalX * SMOOTHING_FACTOR;
+        float sendFY = totalY * SMOOTHING_FACTOR;
+
+        // Round to nearest integer for sending
+        int16_t sendX = (int16_t)(sendFX + (sendFX > 0 ? 0.5f : -0.5f));
+        int16_t sendY = (int16_t)(sendFY + (sendFY > 0 ? 0.5f : -0.5f));
+
+        // Carry the remainder to next frame
+        smoothRemainX = totalX - sendX;
+        smoothRemainY = totalY - sendY;
+
+        // Clamp tiny remainders to prevent drift
+        if (fabsf(smoothRemainX) < 0.5f && accumX == 0) smoothRemainX = 0;
+        if (fabsf(smoothRemainY) < 0.5f && accumY == 0) smoothRemainY = 0;
 
         mouseReport[0] = accumBtn;
         mouseReport[1] = (uint8_t)(sendX & 0xFF);
@@ -318,7 +341,7 @@ static void dispatchHidReport(uint8_t ifaceIdx,
         accumX = 0;
         accumY = 0;
         accumW = 0;
-        mouseDirty = false;
+        mouseDirty = (smoothRemainX != 0 || smoothRemainY != 0);
         lastMouseNotify = now;
       }
     }
@@ -820,8 +843,20 @@ void loop() {
   if (mouseDirty && bleConnected) {
     unsigned long now = millis();
     if (now - lastMouseNotify >= BLE_MOUSE_INTERVAL_MS) {
-      int16_t sendX = (accumX > 32767) ? 32767 : (accumX < -32768) ? -32768 : (int16_t)accumX;
-      int16_t sendY = (accumY > 32767) ? 32767 : (accumY < -32768) ? -32768 : (int16_t)accumY;
+      float totalX = (float)accumX + smoothRemainX;
+      float totalY = (float)accumY + smoothRemainY;
+
+      float sendFX = totalX * SMOOTHING_FACTOR;
+      float sendFY = totalY * SMOOTHING_FACTOR;
+
+      int16_t sendX = (int16_t)(sendFX + (sendFX > 0 ? 0.5f : -0.5f));
+      int16_t sendY = (int16_t)(sendFY + (sendFY > 0 ? 0.5f : -0.5f));
+
+      smoothRemainX = totalX - sendX;
+      smoothRemainY = totalY - sendY;
+
+      if (fabsf(smoothRemainX) < 0.5f && accumX == 0) smoothRemainX = 0;
+      if (fabsf(smoothRemainY) < 0.5f && accumY == 0) smoothRemainY = 0;
 
       uint8_t mouseReport[6] = {0};
       mouseReport[0] = accumBtn;
@@ -837,7 +872,7 @@ void loop() {
       accumX = 0;
       accumY = 0;
       accumW = 0;
-      mouseDirty = false;
+      mouseDirty = (smoothRemainX != 0 || smoothRemainY != 0);
       lastMouseNotify = now;
     }
   }
