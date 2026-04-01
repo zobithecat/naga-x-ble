@@ -187,6 +187,56 @@ static float smoothRemainY = 0;
 // Mode 1: Normal middle click (button 3)
 static uint8_t middleButtonMode = 0;  // 0=Mission Control, 1=Normal
 
+// ─── Scroll Wheel Filter ──────────────────────────────────────
+// Suppress encoder backlash/chatter by locking direction briefly
+#define SCROLL_DIR_LOCK_MS    120   // Ignore reverse direction for this long
+#define SCROLL_REVERSE_COUNT  2    // Require N consecutive reverse events to change direction
+static int8_t  scrollDir = 0;            // Current locked direction: +1, -1, or 0
+static unsigned long scrollDirTime = 0;  // When direction was locked
+static uint8_t scrollReverseCount = 0;   // Consecutive reverse event counter
+
+static int8_t filterScroll(int8_t raw) {
+  if (raw == 0) return 0;
+
+  unsigned long now = millis();
+  int8_t dir = (raw > 0) ? 1 : -1;
+
+  if (scrollDir == 0) {
+    // No direction locked — accept and lock
+    scrollDir = dir;
+    scrollDirTime = now;
+    scrollReverseCount = 0;
+    return raw;
+  }
+
+  if (dir == scrollDir) {
+    // Same direction — accept, refresh lock
+    scrollDirTime = now;
+    scrollReverseCount = 0;
+    return raw;
+  }
+
+  // Opposite direction
+  if (now - scrollDirTime < SCROLL_DIR_LOCK_MS) {
+    // Within lock window — count reverse events
+    scrollReverseCount++;
+    if (scrollReverseCount >= SCROLL_REVERSE_COUNT) {
+      // Enough consecutive reverses — accept direction change
+      scrollDir = dir;
+      scrollDirTime = now;
+      scrollReverseCount = 0;
+      return raw;
+    }
+    return 0;  // Suppress backlash
+  }
+
+  // Lock expired — accept new direction
+  scrollDir = dir;
+  scrollDirTime = now;
+  scrollReverseCount = 0;
+  return raw;
+}
+
 // ─── USB Host Globals ─────────────────────────────────────────
 static usb_host_client_handle_t clientHandle = NULL;
 static uint8_t                  usbDevAddr   = 0;
@@ -303,16 +353,16 @@ static void dispatchHidReport(uint8_t ifaceIdx,
           // Keep bit2 (0x04) in rawBtn for mouse report
         }
         middleWasPressed = middleNow;
-        rawBtn &= ~0x44;  // Strip middle (0x04 and 0x40) from mouse report
       }
 
-      uint8_t btn = (rawBtn & 0x03);            // bits 0-1: Left, Right
+      uint8_t btn = (rawBtn & 0x07);            // bits 0-2: Left, Right, Middle
       if (rawBtn & 0x20) btn |= 0x08;           // bit 5 → bit 3: Back
 
       // Accumulate deltas
       accumX += outX;
       accumY += outY;
-      if (data[3] != 0) accumW = data[3];
+      int8_t filteredW = filterScroll((int8_t)data[3]);
+      if (filteredW != 0) accumW = filteredW;
       accumBtn = btn;
       mouseDirty = true;
 
