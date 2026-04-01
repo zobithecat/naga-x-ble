@@ -27,8 +27,14 @@ Single ESP32-S3 DevKitC-1 board replaces the original two-board setup (Raspberry
 
 ### Signal Processing
 - **Decimation**: USB 1000Hz -> BLE ~125Hz with X/Y delta accumulation
-- **EMA Smoothing**: Exponential moving average (factor 0.75) for smooth diagonal movement
-- **Remainder carry**: Leftover deltas carry to next frame for natural deceleration
+- **Kalman Filter**: 1D Kalman filter per axis for adaptive cursor smoothing
+  - Steady motion: smooth trajectory with fast convergence
+  - Direction change: high responsiveness via adaptive Kalman gain
+  - Sub-pixel remainder tracking for precise slow movement
+  - Tunable: Q (process noise / responsiveness), R (measurement noise / smoothness)
+- **Scroll Debounce**: Direction-lock filter suppresses encoder backlash/chatter
+  - 80ms direction lock window
+  - Requires 2 consecutive reverse events to change direction
 
 ### Button Mapping
 
@@ -78,9 +84,12 @@ Toggle by pressing side buttons 10 and 11 simultaneously.
 Edit defines at the top of `s3_usb_ble_bridge.ino`:
 
 ```c
-#define RAZER_DPI_VALUE        800     // Mouse DPI (100-20000)
-#define SMOOTHING_FACTOR       0.75f   // Cursor smoothing (0.6=smooth, 1.0=raw)
-#define BLE_MOUSE_INTERVAL_MS  8       // BLE notify rate (~125Hz)
+#define RAZER_DPI_VALUE          800   // Mouse DPI (100-20000)
+#define BLE_MOUSE_INTERVAL_MS    8     // BLE notify rate (~125Hz)
+#define KALMAN_Q                 0.5f  // Process noise (higher = more responsive)
+#define KALMAN_R                 3.0f  // Measurement noise (higher = smoother)
+#define SCROLL_DIR_LOCK_MS       80    // Scroll direction lock window (ms)
+#define SCROLL_REVERSE_COUNT     2     // Reverse events needed to change scroll direction
 ```
 
 ## Razer Protocol

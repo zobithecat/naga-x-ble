@@ -174,12 +174,59 @@ static volatile bool     mouseDirty = false;
 static unsigned long     lastMouseNotify = 0;
 #define BLE_MOUSE_INTERVAL_MS  8  // ~125Hz BLE notify rate
 
-// ─── Cursor Smoothing ─────────────────────────────────────────
-// Send a fraction of accumulated delta each frame, carry remainder.
-// Lower = smoother but more latency. 0.7~0.85 recommended.
-#define SMOOTHING_FACTOR  0.75f
-static float smoothRemainX = 0;
-static float smoothRemainY = 0;
+// ─── Kalman Filter for Cursor Smoothing ───────────────────────
+// 1D Kalman filter per axis — estimates velocity (delta per frame)
+// Adapts automatically: steady motion → smooth, quick turns → responsive
+#define KALMAN_Q  0.7f    // Process noise: how much velocity can change per frame
+#define KALMAN_R  3.0f    // Measurement noise: sensor noise level (higher = smoother)
+
+typedef struct {
+  float x;     // State estimate (filtered velocity)
+  float p;     // Estimation error covariance
+  float rem;   // Sub-pixel remainder for integer output
+} kalman1d_t;
+
+static kalman1d_t kfX = { 0, 1.0f, 0 };
+static kalman1d_t kfY = { 0, 1.0f, 0 };
+
+// Kalman predict + update, returns filtered value
+static float kalmanUpdate(kalman1d_t* kf, float measurement) {
+  // Predict
+  // x_pred = x (constant velocity model)
+  float p_pred = kf->p + KALMAN_Q;
+
+  // Update
+  float k = p_pred / (p_pred + KALMAN_R);  // Kalman gain
+  kf->x = kf->x + k * (measurement - kf->x);
+  kf->p = (1.0f - k) * p_pred;
+
+  return kf->x;
+}
+
+// Apply Kalman filter to accumulated delta and return integer output
+static int16_t kalmanApply(kalman1d_t* kf, int32_t rawAccum) {
+  if (rawAccum == 0 && fabsf(kf->x) < 0.5f) {
+    // Mouse stopped — decay to zero
+    kf->x *= 0.3f;
+    kf->rem = 0;
+    return 0;
+  }
+
+  float filtered = kalmanUpdate(kf, (float)rawAccum);
+  float withRem = filtered + kf->rem;
+
+  // Round to integer, keep remainder
+  int16_t out = (int16_t)(withRem + (withRem > 0 ? 0.5f : -0.5f));
+  kf->rem = withRem - out;
+
+  // Prevent drift
+  if (rawAccum == 0 && abs(out) <= 1) {
+    kf->rem = 0;
+    out = 0;
+  }
+
+  return out;
+}
 
 // ─── Middle Button Mode Toggle ────────────────────────────────
 // Side buttons 10+11+12 (0, -, =) pressed simultaneously → toggle
@@ -373,24 +420,9 @@ static void dispatchHidReport(uint8_t ifaceIdx,
       prevBtn = btn;
 
       if (btnChanged || (now - lastMouseNotify >= BLE_MOUSE_INTERVAL_MS)) {
-        // Apply smoothing: send a fraction, carry remainder
-        float totalX = (float)accumX + smoothRemainX;
-        float totalY = (float)accumY + smoothRemainY;
-
-        float sendFX = totalX * SMOOTHING_FACTOR;
-        float sendFY = totalY * SMOOTHING_FACTOR;
-
-        // Round to nearest integer for sending
-        int16_t sendX = (int16_t)(sendFX + (sendFX > 0 ? 0.5f : -0.5f));
-        int16_t sendY = (int16_t)(sendFY + (sendFY > 0 ? 0.5f : -0.5f));
-
-        // Carry the remainder to next frame
-        smoothRemainX = totalX - sendX;
-        smoothRemainY = totalY - sendY;
-
-        // Clamp tiny remainders to prevent drift
-        if (fabsf(smoothRemainX) < 0.5f && accumX == 0) smoothRemainX = 0;
-        if (fabsf(smoothRemainY) < 0.5f && accumY == 0) smoothRemainY = 0;
+        // Apply Kalman filter
+        int16_t sendX = kalmanApply(&kfX, accumX);
+        int16_t sendY = kalmanApply(&kfY, accumY);
 
         mouseReport[0] = accumBtn;
         mouseReport[1] = (uint8_t)(sendX & 0xFF);
@@ -405,7 +437,7 @@ static void dispatchHidReport(uint8_t ifaceIdx,
         accumX = 0;
         accumY = 0;
         accumW = 0;
-        mouseDirty = (smoothRemainX != 0 || smoothRemainY != 0);
+        mouseDirty = (fabsf(kfX.x) > 0.5f || fabsf(kfY.x) > 0.5f);
         lastMouseNotify = now;
       }
     }
@@ -928,20 +960,8 @@ void loop() {
   if (mouseDirty && bleConnected) {
     unsigned long now = millis();
     if (now - lastMouseNotify >= BLE_MOUSE_INTERVAL_MS) {
-      float totalX = (float)accumX + smoothRemainX;
-      float totalY = (float)accumY + smoothRemainY;
-
-      float sendFX = totalX * SMOOTHING_FACTOR;
-      float sendFY = totalY * SMOOTHING_FACTOR;
-
-      int16_t sendX = (int16_t)(sendFX + (sendFX > 0 ? 0.5f : -0.5f));
-      int16_t sendY = (int16_t)(sendFY + (sendFY > 0 ? 0.5f : -0.5f));
-
-      smoothRemainX = totalX - sendX;
-      smoothRemainY = totalY - sendY;
-
-      if (fabsf(smoothRemainX) < 0.5f && accumX == 0) smoothRemainX = 0;
-      if (fabsf(smoothRemainY) < 0.5f && accumY == 0) smoothRemainY = 0;
+      int16_t sendX = kalmanApply(&kfX, accumX);
+      int16_t sendY = kalmanApply(&kfY, accumY);
 
       uint8_t mouseReport[6] = {0};
       mouseReport[0] = accumBtn;
@@ -957,7 +977,7 @@ void loop() {
       accumX = 0;
       accumY = 0;
       accumW = 0;
-      mouseDirty = (smoothRemainX != 0 || smoothRemainY != 0);
+      mouseDirty = (fabsf(kfX.x) > 0.5f || fabsf(kfY.x) > 0.5f);
       lastMouseNotify = now;
     }
   }
