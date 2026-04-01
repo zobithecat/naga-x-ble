@@ -181,6 +181,12 @@ static unsigned long     lastMouseNotify = 0;
 static float smoothRemainX = 0;
 static float smoothRemainY = 0;
 
+// ─── Middle Button Mode Toggle ────────────────────────────────
+// Side buttons 10+11+12 (0, -, =) pressed simultaneously → toggle
+// Mode 0: Mission Control (Ctrl+Up)
+// Mode 1: Normal middle click (button 3)
+static uint8_t middleButtonMode = 0;  // 0=Mission Control, 1=Normal
+
 // ─── USB Host Globals ─────────────────────────────────────────
 static usb_host_client_handle_t clientHandle = NULL;
 static uint8_t                  usbDevAddr   = 0;
@@ -270,23 +276,31 @@ static void dispatchHidReport(uint8_t ifaceIdx,
       // BLE HID: bit0=Left, bit1=Right, bit2=Middle, bit3=Back, bit4=Forward
       uint8_t rawBtn = data[0];
 
-      // Middle button (bit 2) → F3 key (Mission Control / Exposé on macOS)
+      // Middle button handling (mode-dependent)
       {
         static bool middleWasPressed = false;
         bool middleNow = (rawBtn & 0x44) != 0;  // 0x04 or 0x40
 
-        if (middleNow && !middleWasPressed) {
-          // Press Control + Up Arrow (Mission Control on macOS)
-          uint8_t keyReport[8] = {0};
-          keyReport[0] = 0x01;  // Left Control modifier
-          keyReport[2] = 0x52;  // HID keycode Up Arrow
-          keyInput->setValue(keyReport, sizeof(keyReport));
-          keyInput->notify();
-        } else if (!middleNow && middleWasPressed) {
-          // Release F3
-          uint8_t keyReport[8] = {0};
-          keyInput->setValue(keyReport, sizeof(keyReport));
-          keyInput->notify();
+        if (middleButtonMode == 0) {
+          // Mode 0: Mission Control (Ctrl+Up)
+          if (middleNow && !middleWasPressed) {
+            uint8_t keyReport[8] = {0};
+            keyReport[0] = 0x01;  // Left Control
+            keyReport[2] = 0x52;  // Up Arrow
+            keyInput->setValue(keyReport, sizeof(keyReport));
+            keyInput->notify();
+          } else if (!middleNow && middleWasPressed) {
+            uint8_t keyReport[8] = {0};
+            keyInput->setValue(keyReport, sizeof(keyReport));
+            keyInput->notify();
+          }
+          rawBtn &= ~0x44;  // Strip from mouse report
+        } else {
+          // Mode 1: Normal middle click — remap 0x40→0x04
+          if (rawBtn & 0x40) {
+            rawBtn = (rawBtn & ~0x40) | 0x04;  // Move bit6 to bit2
+          }
+          // Keep bit2 (0x04) in rawBtn for mouse report
         }
         middleWasPressed = middleNow;
         rawBtn &= ~0x44;  // Strip middle (0x04 and 0x40) from mouse report
@@ -353,6 +367,27 @@ static void dispatchHidReport(uint8_t ifaceIdx,
     uint8_t keyReport[8] = {0};
     uint8_t copyLen = (len > 8) ? 8 : len;
     memcpy(keyReport, data, copyLen);
+
+    // Check for 10+11 combo (0x27 + 0x2D) → toggle middle button mode
+    {
+      static bool comboTriggered = false;
+      bool has27 = false, has2D = false;
+      for (int i = 2; i < 8; i++) {
+        if (keyReport[i] == 0x27) has27 = true;  // Button 10 (0)
+        if (keyReport[i] == 0x2D) has2D = true;  // Button 11 (-)
+      }
+      if (has27 && has2D) {
+        if (!comboTriggered) {
+          middleButtonMode = (middleButtonMode == 0) ? 1 : 0;
+          LOG.printf("[MODE] Middle button → %s\n",
+                     middleButtonMode == 0 ? "Mission Control" : "Normal Click");
+          comboTriggered = true;
+        }
+        return;  // Swallow combo keys
+      } else {
+        comboTriggered = false;
+      }
+    }
 
     // Remap side buttons:
     //   Button 1 (0x1E) → Cmd+V (GUI + 0x19)
