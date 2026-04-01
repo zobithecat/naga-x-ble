@@ -177,8 +177,8 @@ static unsigned long     lastMouseNotify = 0;
 // ─── Kalman Filter for Cursor Smoothing ───────────────────────
 // 1D Kalman filter per axis — estimates velocity (delta per frame)
 // Adapts automatically: steady motion → smooth, quick turns → responsive
-#define KALMAN_Q  0.7f    // Process noise: how much velocity can change per frame
-#define KALMAN_R  3.0f    // Measurement noise: sensor noise level (higher = smoother)
+#define KALMAN_Q  3.5f    // Process noise: higher = more responsive, less smoothing
+#define KALMAN_R  1.0f    // Measurement noise: lower = trust raw sensor data more
 
 typedef struct {
   float x;     // State estimate (filtered velocity)
@@ -286,6 +286,7 @@ static int8_t filterScroll(int8_t raw) {
 
 // ─── USB Host Globals ─────────────────────────────────────────
 static usb_host_client_handle_t clientHandle = NULL;
+static usb_device_handle_t      devHandle    = NULL;
 static uint8_t                  usbDevAddr   = 0;
 static volatile bool            usbDeviceConnected = false;
 
@@ -450,7 +451,7 @@ static void dispatchHidReport(uint8_t ifaceIdx,
     uint8_t copyLen = (len > 8) ? 8 : len;
     memcpy(keyReport, data, copyLen);
 
-    // Check for 10+11 combo (0x27 + 0x2D) → toggle middle button mode
+    // ── Combo: 10+11 (0 + -) → toggle middle button mode ──
     {
       static bool comboTriggered = false;
       bool has27 = false, has2D = false;
@@ -465,22 +466,56 @@ static void dispatchHidReport(uint8_t ifaceIdx,
                      middleButtonMode == 0 ? "Mission Control" : "Normal Click");
           comboTriggered = true;
         }
-        return;  // Swallow combo keys
+        return;
       } else {
         comboTriggered = false;
       }
     }
 
-    // Remap side buttons:
-    //   Button 1 (0x1E) → Cmd+V (GUI + 0x19)
-    //   Button 3 (0x20) → Cmd+C (GUI + 0x06)
-    for (int i = 2; i < 8; i++) {
-      if (keyReport[i] == 0x1E) {           // Side button 1
-        keyReport[0] |= 0x08;               // Left GUI (Cmd)
-        keyReport[i] = 0x19;                 // 'V'
-      } else if (keyReport[i] == 0x20) {    // Side button 3
-        keyReport[0] |= 0x08;               // Left GUI (Cmd)
-        keyReport[i] = 0x06;                 // 'C'
+    // ── Combo: 11+12 (- + =) → arrow key mode for 2,4,5,6 ──
+    {
+      static bool arrowMode = false;
+      static bool arrowComboTriggered = false;
+      bool has2D = false, has2E = false;
+      for (int i = 2; i < 8; i++) {
+        if (keyReport[i] == 0x2D) has2D = true;  // Button 11 (-)
+        if (keyReport[i] == 0x2E) has2E = true;  // Button 12 (=)
+      }
+      if (has2D && has2E) {
+        if (!arrowComboTriggered) {
+          arrowMode = !arrowMode;
+          LOG.printf("[MODE] Arrow keys → %s\n", arrowMode ? "ON" : "OFF");
+          arrowComboTriggered = true;
+        }
+        return;
+      } else {
+        arrowComboTriggered = false;
+      }
+
+      // Remap side buttons
+      for (int i = 2; i < 8; i++) {
+        if (arrowMode) {
+          // Arrow mode: 2=↑, 4=←, 5=↓, 6=→
+          if      (keyReport[i] == 0x1F) keyReport[i] = 0x52;  // 2 → Up
+          else if (keyReport[i] == 0x21) keyReport[i] = 0x50;  // 4 → Left
+          else if (keyReport[i] == 0x22) keyReport[i] = 0x51;  // 5 → Down
+          else if (keyReport[i] == 0x23) keyReport[i] = 0x4F;  // 6 → Right
+        } else {
+          // Normal mode: 2=F5
+          if (keyReport[i] == 0x1F) {                           // 2 → Cmd+R (Reload)
+            keyReport[0] |= 0x08;                               // Left GUI (Cmd)
+            keyReport[i] = 0x15;                                 // 'R'
+          }
+        }
+
+        // Always active remaps (both modes)
+        if (keyReport[i] == 0x1E) {           // Side button 1 → Cmd+V
+          keyReport[0] |= 0x08;
+          keyReport[i] = 0x19;
+        } else if (keyReport[i] == 0x20) {    // Side button 3 → Cmd+C
+          keyReport[0] |= 0x08;
+          keyReport[i] = 0x06;
+        }
       }
     }
 
@@ -511,10 +546,10 @@ static void usbTransferCallback(usb_transfer_t* transfer) {
 
 // ─── Parse USB Descriptors & Claim HID Interfaces ────────────
 static void openHidDevice(uint8_t dev_addr) {
-  usb_device_handle_t dev_handle = NULL;
+  // Use global devHandle for cleanup on disconnect
   esp_err_t err;
 
-  err = usb_host_device_open(clientHandle, dev_addr, &dev_handle);
+  err = usb_host_device_open(clientHandle, dev_addr, &devHandle);
   if (err != ESP_OK) {
     LOG.printf("[USB] Device open failed: 0x%x\n", err);
     return;
@@ -522,7 +557,7 @@ static void openHidDevice(uint8_t dev_addr) {
 
   // Get device descriptor for VID/PID
   const usb_device_desc_t* dev_desc;
-  usb_host_get_device_descriptor(dev_handle, &dev_desc);
+  usb_host_get_device_descriptor(devHandle, &dev_desc);
   LOG.printf("[USB] Device VID=0x%04X PID=0x%04X\n",
                 dev_desc->idVendor, dev_desc->idProduct);
 
@@ -570,7 +605,7 @@ static void openHidDevice(uint8_t dev_addr) {
       setup[7] = (uint8_t)(RAZER_USB_REPORT_LEN >> 8);    // wLength high
 
       razer_xfer->num_bytes = 8 + RAZER_USB_REPORT_LEN;
-      razer_xfer->device_handle = dev_handle;
+      razer_xfer->device_handle = devHandle;
       razer_xfer->bEndpointAddress = 0;
       razer_xfer->callback = [](usb_transfer_t* t) {
         LOG.printf("[RAZER] SET_DEVICE_MODE response: status=%d\n", t->status);
@@ -626,7 +661,7 @@ static void openHidDevice(uint8_t dev_addr) {
         setup[7] = (uint8_t)(RAZER_USB_REPORT_LEN >> 8);
 
         dpi_xfer->num_bytes = 8 + RAZER_USB_REPORT_LEN;
-        dpi_xfer->device_handle = dev_handle;
+        dpi_xfer->device_handle = devHandle;
         dpi_xfer->bEndpointAddress = 0;
         dpi_xfer->callback = [](usb_transfer_t* t) {
           LOG.printf("[RAZER] SET_DPI response: status=%d\n", t->status);
@@ -671,7 +706,7 @@ static void openHidDevice(uint8_t dev_addr) {
         setup[7] = (uint8_t)(RAZER_USB_REPORT_LEN >> 8);
 
         poll_xfer->num_bytes = 8 + RAZER_USB_REPORT_LEN;
-        poll_xfer->device_handle = dev_handle;
+        poll_xfer->device_handle = devHandle;
         poll_xfer->bEndpointAddress = 0;
         poll_xfer->callback = [](usb_transfer_t* t) {
           LOG.printf("[RAZER] SET_POLL_RATE response: status=%d\n", t->status);
@@ -690,10 +725,10 @@ static void openHidDevice(uint8_t dev_addr) {
 
   // Get active configuration descriptor
   const usb_config_desc_t* config_desc;
-  err = usb_host_get_active_config_descriptor(dev_handle, &config_desc);
+  err = usb_host_get_active_config_descriptor(devHandle, &config_desc);
   if (err != ESP_OK) {
     LOG.printf("[USB] Get config desc failed: 0x%x\n", err);
-    usb_host_device_close(clientHandle, dev_handle);
+    usb_host_device_close(clientHandle, devHandle);
     return;
   }
 
@@ -719,7 +754,7 @@ static void openHidDevice(uint8_t dev_addr) {
                     iface_num, subclass, proto, intf->bNumEndpoints);
 
       // Claim the interface
-      err = usb_host_interface_claim(clientHandle, dev_handle, iface_num, 0);
+      err = usb_host_interface_claim(clientHandle, devHandle, iface_num, 0);
       if (err != ESP_OK) {
         LOG.printf("[USB] Claim interface %d failed: 0x%x\n", iface_num, err);
         offset += intf->bLength;
@@ -766,7 +801,7 @@ static void openHidDevice(uint8_t dev_addr) {
           ctrl_xfer->data_buffer[5] = 0;
           ctrl_xfer->data_buffer[6] = 0; // wLength
           ctrl_xfer->data_buffer[7] = 0;
-          ctrl_xfer->device_handle = dev_handle;
+          ctrl_xfer->device_handle = devHandle;
           ctrl_xfer->bEndpointAddress = 0;
           ctrl_xfer->callback = [](usb_transfer_t* t) {
             usb_host_transfer_free(t);
@@ -791,7 +826,7 @@ static void openHidDevice(uint8_t dev_addr) {
             proto_xfer->data_buffer[5] = 0;
             proto_xfer->data_buffer[6] = 0;    // wLength = 0
             proto_xfer->data_buffer[7] = 0;
-            proto_xfer->device_handle = dev_handle;
+            proto_xfer->device_handle = devHandle;
             proto_xfer->bEndpointAddress = 0;
             proto_xfer->callback = [](usb_transfer_t* t) {
               LOG.printf("[USB] SET_PROTOCOL response: status=%d\n", t->status);
@@ -807,7 +842,7 @@ static void openHidDevice(uint8_t dev_addr) {
         err = usb_host_transfer_alloc(ep_mps, 0, &in_xfer);
         if (err == ESP_OK && in_xfer) {
           in_xfer->num_bytes = ep_mps;
-          in_xfer->device_handle = dev_handle;
+          in_xfer->device_handle = devHandle;
           in_xfer->bEndpointAddress = ep_addr;
           in_xfer->callback = usbTransferCallback;
           in_xfer->timeout_ms = 0;  // No timeout for interrupt
@@ -841,7 +876,7 @@ static void openHidDevice(uint8_t dev_addr) {
     LOG.printf("[USB] Claimed %d HID interface(s)\n", numHidIfaces);
   } else {
     LOG.println("[USB] No HID interfaces found");
-    usb_host_device_close(clientHandle, dev_handle);
+    usb_host_device_close(clientHandle, devHandle);
   }
 }
 
@@ -854,10 +889,31 @@ static void usbClientEventCallback(const usb_host_client_event_msg_t* msg,
       usbDevAddr = msg->new_dev.address;
       break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
-      LOG.println("[USB] Device disconnected");
+      LOG.println("[USB] Device disconnected — cleaning up");
+      // Free all interrupt transfers
+      for (int i = 0; i < numHidIfaces; i++) {
+        if (hidIfaces[i].xfer) {
+          usb_host_transfer_free(hidIfaces[i].xfer);
+          hidIfaces[i].xfer = NULL;
+        }
+        if (hidIfaces[i].active && devHandle) {
+          usb_host_interface_release(clientHandle, devHandle, hidIfaces[i].iface_num);
+        }
+        hidIfaces[i].active = false;
+      }
+      // Close device
+      if (devHandle) {
+        usb_host_device_close(clientHandle, devHandle);
+        devHandle = NULL;
+      }
       usbDeviceConnected = false;
       numHidIfaces = 0;
       usbDevAddr = 0;
+      memset(hidIfaces, 0, sizeof(hidIfaces));
+      // Reset accumulators
+      accumX = 0; accumY = 0; accumW = 0; accumBtn = 0;
+      mouseDirty = false;
+      LOG.println("[USB] Ready for reconnection");
       break;
     default:
       break;
