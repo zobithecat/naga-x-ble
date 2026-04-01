@@ -64,6 +64,14 @@
 #define RAZER_CMD_SET_POLL_RATE_ID     0x05
 #define RAZER_POLL_RATE_1000HZ   0x01   // 0x01=1000Hz, 0x02=500Hz, 0x08=125Hz
 
+// Razer LED control
+#define RAZER_CMD_LED_CLASS      0x0F
+#define RAZER_CMD_LED_ID         0x02
+#define RAZER_LED_SCROLL         0x01
+#define RAZER_LED_LOGO           0x04
+#define RAZER_LED_SIDE           0x10
+#define RAZER_LED_EFFECT_STATIC  0x01
+
 // ─── HID Report Map (BLE side) ────────────────────────────────
 // Combined Mouse (ID=1) + Keyboard (ID=2)
 static const uint8_t hidReportMap[] = {
@@ -177,8 +185,27 @@ static unsigned long     lastMouseNotify = 0;
 // ─── Kalman Filter for Cursor Smoothing ───────────────────────
 // 1D Kalman filter per axis — estimates velocity (delta per frame)
 // Adapts automatically: steady motion → smooth, quick turns → responsive
-#define KALMAN_Q  3.5f    // Process noise: higher = more responsive, less smoothing
-#define KALMAN_R  1.0f    // Measurement noise: lower = trust raw sensor data more
+// Kalman presets — cycle with DPI buttons on the mouse
+typedef struct {
+  float q;
+  float r;
+  const char* name;
+  uint8_t ledR, ledG, ledB;
+} kalman_preset_t;
+
+static const kalman_preset_t kalmanPresets[] = {
+  { 1.0f, 3.0f, "Office",     0x00, 0x60, 0xFF },  // 파랑
+  { 2.0f, 2.0f, "Balanced",   0x00, 0xFF, 0x40 },  // 초록
+  { 3.0f, 1.0f, "Responsive", 0xFF, 0xC0, 0x00 },  // 노랑
+  { 5.0f, 0.5f, "Gaming",     0xFF, 0x20, 0x00 },  // 빨강
+  { 10.0f, 0.1f, "Raw",       0x80, 0x00, 0xFF },  // 보라
+};
+#define NUM_KALMAN_PRESETS  (sizeof(kalmanPresets) / sizeof(kalmanPresets[0]))
+static uint8_t currentPreset = 2;  // Default: Responsive
+
+// Active Kalman params (updated on preset change)
+static float KALMAN_Q = 3.0f;
+static float KALMAN_R = 1.0f;
 
 typedef struct {
   float x;     // State estimate (filtered velocity)
@@ -443,7 +470,33 @@ static void dispatchHidReport(uint8_t ifaceIdx,
       }
     }
 
-  // ── Interface 1: SKIP — Razer proprietary (DPI/macro config, NOT keyboard) ──
+  // ── Interface 1: Razer proprietary — intercept DPI buttons only ──
+  } else if (iface_num == 1) {
+    // Report ID 4 with keycode 0x20=DPI Up, 0x21=DPI Down
+    if (len >= 2 && data[0] == 0x04) {
+      static bool dpiTriggered = false;
+      if (data[1] == 0x20 || data[1] == 0x21) {
+        if (!dpiTriggered) {
+          if (data[1] == 0x20 && currentPreset < NUM_KALMAN_PRESETS - 1) {
+            currentPreset++;
+          } else if (data[1] == 0x21 && currentPreset > 0) {
+            currentPreset--;
+          }
+          KALMAN_Q = kalmanPresets[currentPreset].q;
+          KALMAN_R = kalmanPresets[currentPreset].r;
+          kfX.p = 1.0f; kfY.p = 1.0f;
+          // LED feedback
+          razerSetAllLeds(kalmanPresets[currentPreset].ledR,
+                          kalmanPresets[currentPreset].ledG,
+                          kalmanPresets[currentPreset].ledB);
+          LOG.printf("[KALMAN] Preset: %s (Q=%.1f R=%.1f)\n",
+                     kalmanPresets[currentPreset].name, KALMAN_Q, KALMAN_R);
+          dpiTriggered = true;
+        }
+      } else if (data[1] == 0x00) {
+        dpiTriggered = false;  // Button released
+      }
+    }
 
   // ── Interface 2: Boot Keyboard (side buttons, proto=1, mps=8) ──
   } else if (iface_num == 2 && protocol == USB_HID_PROTOCOL_KBD) {
@@ -542,6 +595,60 @@ static void usbTransferCallback(usb_transfer_t* transfer) {
   if (transfer->status != USB_TRANSFER_STATUS_CANCELED) {
     usb_host_transfer_submit(transfer);
   }
+}
+
+// ─── Razer LED Color Set ──────────────────────────────────────
+static void razerSetLedColor(uint8_t ledId, uint8_t r, uint8_t g, uint8_t b) {
+  if (!devHandle) return;
+
+  usb_transfer_t* xfer = NULL;
+  esp_err_t err = usb_host_transfer_alloc(RAZER_USB_REPORT_LEN + 8, 0, &xfer);
+  if (err != ESP_OK || !xfer) return;
+
+  uint8_t* setup = xfer->data_buffer;
+  uint8_t* report = setup + 8;
+  memset(report, 0, RAZER_USB_REPORT_LEN);
+
+  report[0] = 0x00;                    // status
+  report[1] = RAZER_TRANSACTION_ID;    // 0x1F
+  report[5] = 0x09;                    // data_size
+  report[6] = RAZER_CMD_LED_CLASS;     // 0x0F
+  report[7] = RAZER_CMD_LED_ID;        // 0x02
+  report[8]  = 0x01;                   // VARSTORE
+  report[9]  = ledId;                  // LED region
+  report[10] = RAZER_LED_EFFECT_STATIC; // 0x01
+  report[11] = 0x00;
+  report[12] = 0x00;
+  report[13] = 0x01;                   // param (always 1 for static)
+  report[14] = r;
+  report[15] = g;
+  report[16] = b;
+
+  uint8_t crc = 0;
+  for (int i = 2; i < 88; i++) crc ^= report[i];
+  report[88] = crc;
+
+  setup[0] = 0x21; setup[1] = 0x09;
+  setup[2] = 0x00; setup[3] = 0x03;
+  setup[4] = 0x00; setup[5] = 0x00;
+  setup[6] = (uint8_t)(RAZER_USB_REPORT_LEN & 0xFF);
+  setup[7] = (uint8_t)(RAZER_USB_REPORT_LEN >> 8);
+
+  xfer->num_bytes = 8 + RAZER_USB_REPORT_LEN;
+  xfer->device_handle = devHandle;
+  xfer->bEndpointAddress = 0;
+  xfer->callback = [](usb_transfer_t* t) { usb_host_transfer_free(t); };
+
+  usb_host_transfer_submit_control(clientHandle, xfer);
+}
+
+// Set all LED zones to the same color
+static void razerSetAllLeds(uint8_t r, uint8_t g, uint8_t b) {
+  razerSetLedColor(RAZER_LED_SCROLL, r, g, b);
+  vTaskDelay(pdMS_TO_TICKS(10));
+  razerSetLedColor(RAZER_LED_LOGO, r, g, b);
+  vTaskDelay(pdMS_TO_TICKS(10));
+  razerSetLedColor(RAZER_LED_SIDE, r, g, b);
 }
 
 // ─── Parse USB Descriptors & Claim HID Interfaces ────────────
@@ -721,6 +828,13 @@ static void openHidDevice(uint8_t dev_addr) {
         vTaskDelay(pdMS_TO_TICKS(50));
       }
     }
+
+    // ── Set initial LED color from current preset ──
+    vTaskDelay(pdMS_TO_TICKS(50));
+    razerSetAllLeds(kalmanPresets[currentPreset].ledR,
+                    kalmanPresets[currentPreset].ledG,
+                    kalmanPresets[currentPreset].ledB);
+    LOG.printf("[RAZER] LED set to %s color\n", kalmanPresets[currentPreset].name);
   }
 
   // Get active configuration descriptor
