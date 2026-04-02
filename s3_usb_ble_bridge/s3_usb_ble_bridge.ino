@@ -22,9 +22,12 @@
  */
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 #include "usb/usb_host.h"
+
+static Preferences prefs;
 
 // Use UART0 for serial output (external UART chip on /dev/cu.usbserial-*)
 // "Hardware CDC and JTAG" mode maps Serial to internal USB CDC,
@@ -261,54 +264,42 @@ static int16_t kalmanApply(kalman1d_t* kf, int32_t rawAccum) {
 // Mode 1: Normal middle click (button 3)
 static uint8_t middleButtonMode = 0;  // 0=Mission Control, 1=Normal
 
-// ─── Scroll Wheel Filter ──────────────────────────────────────
-// Suppress encoder backlash/chatter by locking direction briefly
-#define SCROLL_DIR_LOCK_MS    120   // Ignore reverse direction for this long
-#define SCROLL_REVERSE_COUNT  2    // Require N consecutive reverse events to change direction
-static int8_t  scrollDir = 0;            // Current locked direction: +1, -1, or 0
-static unsigned long scrollDirTime = 0;  // When direction was locked
-static uint8_t scrollReverseCount = 0;   // Consecutive reverse event counter
+// ─── Scroll Wheel Filter (Leaky Integrator) ──────────────────
+// Biased encoder signal: +1 +1 -1 +1 -1 +1 (net positive = real scroll up)
+// Leaky integrator decays old events, so only sustained bias produces output.
+// Unbiased noise (+1 -1 +1 -1) decays to zero → no output.
+#define SCROLL_DECAY    0.85f   // Per-event decay (higher = more memory)
+#define SCROLL_THRESH   2.2f    // Balance: usable with broken encoder, no false triggers
+#define SCROLL_IDLE_MS  300     // Reset integrator after idle
+
+static float scrollIntegrator = 0;
+static unsigned long lastScrollIn = 0;
 
 static int8_t filterScroll(int8_t raw) {
   if (raw == 0) return 0;
 
   unsigned long now = millis();
-  int8_t dir = (raw > 0) ? 1 : -1;
 
-  if (scrollDir == 0) {
-    // No direction locked — accept and lock
-    scrollDir = dir;
-    scrollDirTime = now;
-    scrollReverseCount = 0;
-    return raw;
+  // Reset after idle
+  if (now - lastScrollIn > SCROLL_IDLE_MS) {
+    scrollIntegrator = 0;
+  }
+  lastScrollIn = now;
+
+  // Decay old signal, add new
+  scrollIntegrator *= SCROLL_DECAY;
+  scrollIntegrator += (float)raw;
+
+  // Emit when integrator crosses threshold
+  if (scrollIntegrator >= SCROLL_THRESH) {
+    scrollIntegrator -= SCROLL_THRESH;
+    return 1;
+  } else if (scrollIntegrator <= -SCROLL_THRESH) {
+    scrollIntegrator += SCROLL_THRESH;
+    return -1;
   }
 
-  if (dir == scrollDir) {
-    // Same direction — accept, refresh lock
-    scrollDirTime = now;
-    scrollReverseCount = 0;
-    return raw;
-  }
-
-  // Opposite direction
-  if (now - scrollDirTime < SCROLL_DIR_LOCK_MS) {
-    // Within lock window — count reverse events
-    scrollReverseCount++;
-    if (scrollReverseCount >= SCROLL_REVERSE_COUNT) {
-      // Enough consecutive reverses — accept direction change
-      scrollDir = dir;
-      scrollDirTime = now;
-      scrollReverseCount = 0;
-      return raw;
-    }
-    return 0;  // Suppress backlash
-  }
-
-  // Lock expired — accept new direction
-  scrollDir = dir;
-  scrollDirTime = now;
-  scrollReverseCount = 0;
-  return raw;
+  return 0;
 }
 
 // ─── USB Host Globals ─────────────────────────────────────────
@@ -371,15 +362,7 @@ static void dispatchHidReport(uint8_t ifaceIdx,
   uint8_t protocol = hidIfaces[ifaceIdx].protocol;
   uint8_t iface_num = hidIfaces[ifaceIdx].iface_num;
 
-  if (!bleConnected) {
-    // Log once per second when BLE not connected
-    static unsigned long lastLog = 0;
-    if (millis() - lastLog > 1000) {
-      LOG.printf("[WAIT] iface=%d data but BLE not connected\n", iface_num);
-      lastLog = millis();
-    }
-    return;
-  }
+  if (!bleConnected) return;
 
   // ── Interface 0: Mouse (proto=2) ──
   // Razer Driver Mode report: [buttons, X(int8), Y(int8), wheel(int8), ...]
@@ -436,8 +419,11 @@ static void dispatchHidReport(uint8_t ifaceIdx,
       // Accumulate deltas
       accumX += outX;
       accumY += outY;
-      int8_t filteredW = filterScroll((int8_t)data[3]);
-      if (filteredW != 0) accumW = filteredW;
+      int8_t rawScroll = (int8_t)data[3];
+      {
+        int8_t filteredW = filterScroll(rawScroll);
+        if (filteredW != 0) accumW = filteredW;
+      }
       accumBtn = btn;
       mouseDirty = true;
 
@@ -489,7 +475,11 @@ static void dispatchHidReport(uint8_t ifaceIdx,
           razerSetAllLeds(kalmanPresets[currentPreset].ledR,
                           kalmanPresets[currentPreset].ledG,
                           kalmanPresets[currentPreset].ledB);
-          LOG.printf("[KALMAN] Preset: %s (Q=%.1f R=%.1f)\n",
+          // Save preset to NVS
+          prefs.begin("naga", false);
+          prefs.putUChar("kalPreset", currentPreset);
+          prefs.end();
+          LOG.printf("[KALMAN] Preset: %s (Q=%.1f R=%.1f) — saved\n",
                      kalmanPresets[currentPreset].name, KALMAN_Q, KALMAN_R);
           dpiTriggered = true;
         }
@@ -503,6 +493,8 @@ static void dispatchHidReport(uint8_t ifaceIdx,
     uint8_t keyReport[8] = {0};
     uint8_t copyLen = (len > 8) ? 8 : len;
     memcpy(keyReport, data, copyLen);
+
+
 
     // ── Combo: 10+11 (0 + -) → toggle middle button mode ──
     {
@@ -1108,6 +1100,16 @@ void setup() {
   LOG.begin(115200);
   delay(500);
   LOG.println("\n=== Vendit Naga X — ESP32-S3 USB-OTG BLE Bridge ===");
+
+  // Load saved Kalman preset from NVS
+  prefs.begin("naga", false);
+  currentPreset = prefs.getUChar("kalPreset", 2);
+  if (currentPreset >= NUM_KALMAN_PRESETS) currentPreset = 2;
+  KALMAN_Q = kalmanPresets[currentPreset].q;
+  KALMAN_R = kalmanPresets[currentPreset].r;
+  LOG.printf("[NVS] Loaded: preset=%s (Q=%.1f R=%.1f)\n",
+             kalmanPresets[currentPreset].name, KALMAN_Q, KALMAN_R);
+  prefs.end();
 
   // Init interface tracking
   memset(hidIfaces, 0, sizeof(hidIfaces));
