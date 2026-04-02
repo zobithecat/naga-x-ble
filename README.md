@@ -1,6 +1,6 @@
 # Naga X BLE Bridge
 
-Razer Naga Left-Handed Edition (PID 0x008D) USB-to-BLE HID bridge using ESP32-S3.
+Razer Naga Left-Handed Edition (RZ01-0341, PID 0x008D) USB-to-BLE HID bridge using ESP32-S3.
 
 > **한국어**: Razer Naga 왼손잡이 에디션을 ESP32-S3 하나로 BLE 무선 마우스로 변환하는 펌웨어입니다.
 > macOS에서 Synapse 미지원, Karabiner 매핑 불가 문제를 해결합니다.
@@ -18,7 +18,7 @@ Single ESP32-S3 DevKitC-1 board replaces the original two-board setup (Raspberry
 ### USB Host
 - ESP-IDF native `usb_host` API (no TinyUSB dependency)
 - 4 HID interfaces claimed (mouse, keyboard, Razer proprietary, consumer)
-- Razer Driver Mode activation (enables middle button via vendor protocol)
+- Razer Driver Mode activation (enables wheel click via vendor protocol)
 - Configurable DPI (default 800, range 100-20000)
 - 1000Hz USB polling rate
 - **Hot-plug support**: USB disconnect/reconnect without reboot
@@ -35,32 +35,35 @@ Single ESP32-S3 DevKitC-1 board replaces the original two-board setup (Raspberry
   - Steady motion: smooth trajectory with fast convergence
   - Direction change: high responsiveness via adaptive Kalman gain
   - Sub-pixel remainder tracking for precise slow movement
-  - Tunable: Q (process noise / responsiveness), R (measurement noise / smoothness)
+  - 5 presets switchable via DPI buttons with LED color feedback
   - macOS pointer acceleration OFF recommended for best results
-- **Scroll Debounce**: Direction-lock filter suppresses encoder backlash/chatter
-  - 80ms direction lock window
-  - Requires 2 consecutive reverse events to change direction
+- **Scroll Filter**: Leaky integrator absorbs encoder bounce/chatter
+  - Per-event decay (0.85) + threshold (3.5)
+  - Biased signal passes, unbiased noise self-cancels
 
 ### Button Mapping
 
-#### Default Mode (일반 모드)
+#### Physical Button Map (물리 버튼 맵)
 
-| Input | Action | 설명 |
-|-------|--------|------|
-| Left click | Left click | 좌클릭 |
-| Right click | Right click | 우클릭 |
-| Middle click (wheel) | Mission Control (Ctrl+Up) | 미션 컨트롤 |
-| Back (side) | Back | 뒤로가기 |
-| Forward (side) | Forward | 앞으로가기 |
-| Side button 1 | Cmd+V (Paste) | 붙여넣기 |
-| Side button 2 | Cmd+R (Reload) | 새로고침 |
-| Side button 3 | Cmd+C (Copy) | 복사 |
-| Side buttons 4-9 | Number keys | 숫자키 패스스루 |
-| Side 10, 11, 12 | 0, -, = keys | 숫자키 패스스루 |
+| Physical Button | HID Bit | Mapped Action | 설명 |
+|----------------|---------|---------------|------|
+| Left click | 0x01 | Left click | 좌클릭 |
+| Right click | 0x02 | Right click | 우클릭 |
+| Wheel left button | 0x40 | Mission Control (Ctrl+Up) | 미션 컨트롤 |
+| Wheel right button | 0x20 | Back | 뒤로가기 |
+| Wheel both buttons | 0x04 | Middle click | 중간클릭 (Onshape orbit) |
+| Scroll wheel | byte[3] | Scroll (filtered) | 스크롤 (leaky integrator) |
+| Side button 1 | 0x1E | Cmd+V (Paste) | 붙여넣기 |
+| Side button 2 | 0x1F | Cmd+R (Reload) | 새로고침 |
+| Side button 3 | 0x20 | Cmd+C (Copy) | 복사 |
+| Side buttons 4-9 | 0x21-0x26 | Number keys | 숫자키 패스스루 |
+| Side 10, 11, 12 | 0x27,0x2D,0x2E | 0, -, = keys | 숫자키 패스스루 |
+| DPI Up button | iface1: 0x04/0x20 | Kalman preset up | 칼만 프리셋 ▲ |
+| DPI Down button | iface1: 0x04/0x21 | Kalman preset down | 칼만 프리셋 ▼ |
 
 #### Arrow Mode (방향키 모드 — 터미널/FPS용)
 
-11+12 동시 누르기로 토글. 한 손으로 마우스 + 방향키 조작 가능.
+Side 11+12 동시 누르기로 토글. 한 손으로 마우스 + 방향키 조작 가능.
 
 | Input | Action | 설명 |
 |-------|--------|------|
@@ -73,12 +76,205 @@ Single ESP32-S3 DevKitC-1 board replaces the original two-board setup (Raspberry
 
 | Combo | Action | 설명 |
 |-------|--------|------|
-| Side 10 + 11 (0 + -) | Toggle middle button mode | 중간버튼: Mission Control <-> 일반 클릭 |
 | Side 11 + 12 (- + =) | Toggle arrow key mode | 사이드 2,4,5,6을 방향키로 전환 |
+| DPI Up / Down | Cycle Kalman preset | 칼만 프리셋 순환 + LED 색상 변경 |
 
-### Middle Button Modes (중간버튼 모드)
-- **Mode 0** (default): Mission Control (Ctrl + Up Arrow) — macOS Expose
-- **Mode 1**: Normal middle click — Onshape/CAD 3D orbit
+#### Kalman Presets (DPI 버튼으로 전환, LED 색상 피드백)
+
+| Preset | Q | R | LED | Feel |
+|--------|---|---|-----|------|
+| Office | 1.0 | 3.0 | Blue | 부드러움 |
+| Balanced | 2.0 | 2.0 | Green | 균형 |
+| Responsive | 3.0 | 1.0 | Yellow | 반응형 |
+| Gaming | 5.0 | 0.5 | Red | 거의 raw |
+| Raw | 10.0 | 0.1 | Purple | 무보정 |
+
+> Tip: macOS에서 시스템 설정 > 포인터 가속 끄기를 권장합니다.
+
+---
+
+## Razer Naga Left-Handed Edition Protocol Reference
+
+### Device Identity
+
+| Field | Value |
+|-------|-------|
+| VID | 0x1532 (Razer Inc.) |
+| PID | 0x008D |
+| Model | RZ01-0341 |
+| Name | Naga Left-Handed Edition 2020 |
+| Sensor | Razer Focus+ Optical, max 20000 DPI |
+| Buttons | Left, Right, Wheel Left, Wheel Right, Wheel Both, 12 side, 2 DPI |
+
+### USB HID Interfaces
+
+The mouse enumerates 4 HID interfaces:
+
+| Interface | Subclass | Protocol | EP | MPS | Purpose |
+|-----------|----------|----------|----|-----|---------|
+| 0 | 1 (Boot) | 2 (Mouse) | 0x81 IN | 8 | Mouse movement + buttons |
+| 1 | 0 | 1 (Keyboard) | 0x82 IN | 16 | Razer proprietary (DPI events, config) |
+| 2 | 1 (Boot) | 1 (Keyboard) | 0x83 IN | 8 | Side buttons (keyboard keycodes) |
+| 3 | 0 | 2 (Mouse) | 0x84 IN | 2 | Unknown (possibly consumer control) |
+
+### Interface 0 — Mouse Report (8 bytes)
+
+```
+Byte:  [0]      [1]    [2]    [3]     [4]    [5]    [6]    [7]
+Field: buttons  X(8b)  Y(8b)  wheel   X_lo   X_hi   Y_lo   Y_hi
+                                       ← 16-bit LE →  ← 16-bit LE →
+```
+
+- Bytes 1-2: 8-bit signed X/Y (boot protocol compatibility)
+- Bytes 4-7: 16-bit signed X/Y little-endian (full DPI resolution)
+- Byte 3: Scroll wheel, signed 8-bit (+1=down, -1=up, multi-tick possible)
+
+#### Button Bit Map (byte 0)
+
+| Bit | Hex | Physical Button |
+|-----|-----|----------------|
+| 0 | 0x01 | Left click |
+| 1 | 0x02 | Right click |
+| 2 | 0x04 | Wheel both buttons (HW combo) |
+| 5 | 0x20 | Wheel right button |
+| 6 | 0x40 | Wheel left button |
+
+> **Critical**: Bit 2 (0x04) is sent by hardware when both wheel buttons are pressed simultaneously. Bits 5 and 6 are independent wheel side buttons. This is NOT standard HID — it's a Razer-specific button layout.
+
+> **Driver Mode Required**: Without SET_DEVICE_MODE(0x03), the mouse does NOT send 0x04 (wheel click) at all. Only 0x01 and 0x02 are sent in Device Mode.
+
+### Interface 1 — Razer Proprietary (16 bytes)
+
+Report format: `[ReportID] [Keycode] [padding...]`
+
+| Report ID | Keycode | Meaning |
+|-----------|---------|---------|
+| 0x04 | 0x20 | DPI Up button pressed |
+| 0x04 | 0x21 | DPI Down button pressed |
+| 0x04 | 0x00 | DPI button released |
+| 0x05 | 0x02 XX XX ... | DPI status (XX XX = current DPI big-endian) |
+
+DPI status example: `05 02 03 20 03 20` = X:800 Y:800 (0x0320 = 800)
+
+### Interface 2 — Side Buttons (8 bytes, keyboard format)
+
+Standard HID keyboard report: `[mod] [reserved] [key1] [key2] ... [key6]`
+
+| Side Button | HID Keycode | Key |
+|-------------|-------------|-----|
+| 1 | 0x1E | 1 |
+| 2 | 0x1F | 2 |
+| 3 | 0x20 | 3 |
+| 4 | 0x21 | 4 |
+| 5 | 0x22 | 5 |
+| 6 | 0x23 | 6 |
+| 7 | 0x24 | 7 |
+| 8 | 0x25 | 8 |
+| 9 | 0x26 | 9 |
+| 10 | 0x27 | 0 |
+| 11 | 0x2D | - |
+| 12 | 0x2E | = |
+
+### Interface 3 — Unknown (2 bytes)
+
+MPS=2, protocol=mouse. No meaningful data observed. Possibly battery/consumer control.
+
+### Razer Vendor Command Protocol
+
+90-byte Feature Report sent via USB Control Transfer.
+
+#### Transport
+
+| Parameter | Value |
+|-----------|-------|
+| bmRequestType | 0x21 (Class, Interface, OUT) |
+| bRequest | 0x09 (SET_REPORT) |
+| wValue | 0x0300 (Feature Report, ID 0) |
+| wIndex | 0x0000 (Interface 0) |
+| wLength | 90 (0x5A) |
+
+#### Packet Structure
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 1 | status | 0x00 = new command |
+| 1 | 1 | transaction_id | **0x1F** for this device |
+| 2-3 | 2 | remaining_packets | 0x0000 |
+| 4 | 1 | protocol_type | 0x00 |
+| 5 | 1 | data_size | Payload byte count |
+| 6 | 1 | command_class | Command category |
+| 7 | 1 | command_id | Specific command |
+| 8-87 | 80 | arguments | Command-specific payload |
+| 88 | 1 | crc | XOR of bytes 2..87 |
+| 89 | 1 | reserved | 0x00 |
+
+#### Commands Used
+
+**SET_DEVICE_MODE** — Enable Driver Mode (required for wheel click)
+
+| Field | Value |
+|-------|-------|
+| data_size | 0x02 |
+| command_class | 0x00 |
+| command_id | 0x04 |
+| args[0] | 0x03 (Driver Mode) |
+| args[1] | 0x00 |
+
+> Device Mode (0x00) = default, no wheel click HID events
+> Driver Mode (0x03) = full button reporting including 0x04/0x20/0x40
+
+**SET_DPI**
+
+| Field | Value |
+|-------|-------|
+| data_size | 0x07 |
+| command_class | 0x04 |
+| command_id | 0x05 |
+| args[0] | 0x01 (VARSTORE, persistent) |
+| args[1-2] | X DPI (big-endian uint16) |
+| args[3-4] | Y DPI (big-endian uint16) |
+| args[5-6] | 0x00 |
+
+DPI range: 100 — 20000. Example: 800 DPI = `0x03 0x20`
+
+**SET_POLL_RATE**
+
+| Field | Value |
+|-------|-------|
+| data_size | 0x01 |
+| command_class | 0x00 |
+| command_id | 0x05 |
+| args[0] | Rate code |
+
+| Code | Rate |
+|------|------|
+| 0x01 | 1000Hz |
+| 0x02 | 500Hz |
+| 0x08 | 125Hz |
+
+**SET_LED_STATIC** — Set LED color
+
+| Field | Value |
+|-------|-------|
+| data_size | 0x09 |
+| command_class | 0x0F |
+| command_id | 0x02 |
+| args[0] | 0x01 (VARSTORE) |
+| args[1] | LED ID |
+| args[2] | 0x01 (Static effect) |
+| args[3-4] | 0x00 |
+| args[5] | 0x01 |
+| args[6] | Red (0-255) |
+| args[7] | Green (0-255) |
+| args[8] | Blue (0-255) |
+
+| LED ID | Zone |
+|--------|------|
+| 0x01 | Scroll wheel |
+| 0x04 | Logo |
+| 0x10 | Side (thumb grid) |
+
+---
 
 ## Hardware
 
@@ -94,7 +290,7 @@ Single ESP32-S3 DevKitC-1 board replaces the original two-board setup (Raspberry
 ### Future: Battery Build (배터리 내장)
 - Seeed XIAO ESP32S3 (21x17.5mm, LiPo charging built-in)
 - 301230 LiPo battery (80mAh, ~1.5h) or larger
-- Deep sleep on idle for extended battery life
+- ESP32-S3 Light Sleep (~2mA) on idle, USB interrupt wakeup
 
 ## Arduino IDE Settings
 
@@ -119,41 +315,14 @@ Edit defines at the top of `s3_usb_ble_bridge.ino`:
 // BLE
 #define BLE_MOUSE_INTERVAL_MS    8     // BLE notify rate (~125Hz)
 
-// Kalman Filter (커서 스무딩)
-#define KALMAN_Q                 3.0f  // Process noise (higher = responsive, lower = smooth)
-#define KALMAN_R                 1.0f  // Measurement noise (higher = smooth, lower = raw)
+// Kalman Filter
+#define KALMAN_Q                 3.0f  // Process noise (higher = responsive)
+#define KALMAN_R                 1.0f  // Measurement noise (higher = smooth)
 
-// Scroll Debounce (스크롤 디바운스)
-#define SCROLL_DIR_LOCK_MS       80    // Direction lock window (ms)
-#define SCROLL_REVERSE_COUNT     2     // Reverse events to change direction
+// Scroll Filter (Leaky Integrator)
+#define SCROLL_DECAY             0.85f // Per-event decay
+#define SCROLL_THRESH            3.5f  // Emit threshold (raise for broken encoders)
 ```
-
-### Kalman Tuning Guide (칼만 필터 튜닝)
-
-| Use Case | Q | R | Feel |
-|----------|---|---|------|
-| Office (사무용) | 1.0 | 3.0 | Smooth, slight lag |
-| Balanced (균형) | 2.0 | 2.0 | Good all-round |
-| Responsive (반응형) | 3.0 | 1.0 | Near-raw, slight smoothing |
-| Gaming (게이밍) | 5.0 | 0.5 | Almost raw input |
-| Raw (무보정) | 10.0 | 0.1 | No filtering |
-
-> Tip: macOS에서 시스템 설정 > 포인터 가속 끄기를 권장합니다. 칼만 필터와 OS 가속이 이중으로 적용되면 둥실둥실한 느낌이 납니다.
-
-## Razer Protocol
-
-The firmware sends three vendor-specific commands on USB connection:
-
-1. **SET_DEVICE_MODE** (0x03) - Switches to Driver Mode, enables middle button
-2. **SET_DPI** - Configures mouse sensitivity (stored persistently on device)
-3. **SET_POLL_RATE** (1000Hz) - Maximum USB report rate
-
-These use Razer's 90-byte Feature Report protocol:
-- Transaction ID: 0x1F (Naga Left-Handed 2020)
-- USB Control Transfer: bmRequestType=0x21, bRequest=0x09, wValue=0x0300
-
-> Without Driver Mode, the Naga does not send middle button (wheel click) via HID at all.
-> This was discovered through reverse-engineering the openrazer project.
 
 ## Project Structure
 
@@ -172,10 +341,15 @@ naga-x-ble/
 ## Future Ideas
 
 - Battery-powered build with XIAO ESP32S3 (LiPo charging built-in)
-- Deep sleep on idle for battery life
+- Light sleep on idle with USB interrupt wakeup
 - USB-to-USB bridge mode via RP2040 for gaming latency (~1ms)
-- Profile switching (gaming vs office) via side button combo
 - Per-application profiles (auto-detect active app)
+- NVS-stored button remapping configuration
+
+## Acknowledgments
+
+- [openrazer](https://github.com/openrazer/openrazer) — Razer vendor protocol reverse engineering
+- [razer-macos](https://github.com/1kc/razer-macos) — macOS Razer driver reference
 
 ## License
 

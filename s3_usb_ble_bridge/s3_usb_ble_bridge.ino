@@ -42,7 +42,7 @@ static Preferences prefs;
 // Mouse sensitivity: divide raw X/Y by this value.
 // Naga X at high DPI sends very large deltas.
 // Increase to slow down, decrease to speed up. 1 = raw passthrough.
-#define MOUSE_SENSITIVITY_DIV  16
+#define MOUSE_SENSITIVITY_DIV  1
 
 // USB HID class constants
 #define USB_CLASS_HID             0x03
@@ -62,7 +62,7 @@ static Preferences prefs;
 #define RAZER_DRIVER_MODE        0x03
 #define RAZER_CMD_SET_DPI_CLASS  0x04
 #define RAZER_CMD_SET_DPI_ID     0x05
-#define RAZER_DPI_VALUE          1000     // Change this to your preferred DPI (100-20000)
+#define RAZER_DPI_VALUE          8000     // Change this to your preferred DPI (100-20000)
 #define RAZER_CMD_SET_POLL_RATE_CLASS  0x00
 #define RAZER_CMD_SET_POLL_RATE_ID     0x05
 #define RAZER_POLL_RATE_1000HZ   0x01   // 0x01=1000Hz, 0x02=500Hz, 0x08=125Hz
@@ -268,9 +268,9 @@ static uint8_t middleButtonMode = 0;  // 0=Mission Control, 1=Normal
 // Biased encoder signal: +1 +1 -1 +1 -1 +1 (net positive = real scroll up)
 // Leaky integrator decays old events, so only sustained bias produces output.
 // Unbiased noise (+1 -1 +1 -1) decays to zero → no output.
-#define SCROLL_DECAY    0.85f   // Per-event decay (higher = more memory)
-#define SCROLL_THRESH   2.2f    // Balance: usable with broken encoder, no false triggers
-#define SCROLL_IDLE_MS  300     // Reset integrator after idle
+#define SCROLL_DECAY    0.5f   // Per-event decay (higher = more memory)
+#define SCROLL_THRESH   1.2f    // High threshold for broken encoder + high DPI setup
+#define SCROLL_IDLE_MS  100     // Reset integrator after idle
 
 static float scrollIntegrator = 0;
 static unsigned long lastScrollIn = 0;
@@ -384,33 +384,33 @@ static void dispatchHidReport(uint8_t ifaceIdx,
       // BLE HID: bit0=Left, bit1=Right, bit2=Middle, bit3=Back, bit4=Forward
       uint8_t rawBtn = data[0];
 
-      // Middle button handling (mode-dependent)
+      // ── Wheel Buttons ──
+      // 0x40 = wheel left  → Mission Control (Ctrl+Up)
+      // 0x20 = wheel right → Back (already bit5, remap to bit3 below)
+      // 0x04 = both pressed (HW combo) → middle click (keep as bit2)
       {
-        static bool middleWasPressed = false;
-        bool middleNow = (rawBtn & 0x44) != 0;  // 0x04 or 0x40
+        static bool missionActive = false;
 
-        if (middleButtonMode == 0) {
-          // Mode 0: Mission Control (Ctrl+Up)
-          if (middleNow && !middleWasPressed) {
+        // Wheel left (0x40) → Mission Control
+        if (rawBtn & 0x40) {
+          if (!missionActive) {
             uint8_t keyReport[8] = {0};
             keyReport[0] = 0x01;  // Left Control
             keyReport[2] = 0x52;  // Up Arrow
             keyInput->setValue(keyReport, sizeof(keyReport));
             keyInput->notify();
-          } else if (!middleNow && middleWasPressed) {
-            uint8_t keyReport[8] = {0};
-            keyInput->setValue(keyReport, sizeof(keyReport));
-            keyInput->notify();
+            missionActive = true;
           }
-          rawBtn &= ~0x44;  // Strip from mouse report
-        } else {
-          // Mode 1: Normal middle click — remap 0x40→0x04
-          if (rawBtn & 0x40) {
-            rawBtn = (rawBtn & ~0x40) | 0x04;  // Move bit6 to bit2
-          }
-          // Keep bit2 (0x04) in rawBtn for mouse report
+          rawBtn &= ~0x40;  // Strip from mouse report
+        } else if (missionActive) {
+          uint8_t keyReport[8] = {0};
+          keyInput->setValue(keyReport, sizeof(keyReport));
+          keyInput->notify();
+          missionActive = false;
         }
-        middleWasPressed = middleNow;
+
+        // 0x20 (wheel right) → Back: handled below in btn remap (bit5→bit3)
+        // 0x04 (both) → middle click: already bit2, pass through
       }
 
       uint8_t btn = (rawBtn & 0x07);            // bits 0-2: Left, Right, Middle
