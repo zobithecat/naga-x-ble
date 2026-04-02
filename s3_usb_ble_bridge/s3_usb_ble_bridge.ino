@@ -385,14 +385,14 @@ static void dispatchHidReport(uint8_t ifaceIdx,
       uint8_t rawBtn = data[0];
 
       // ── Wheel Buttons ──
-      // 0x40 = wheel left  → Mission Control (Ctrl+Up)
-      // 0x20 = wheel right → Back (already bit5, remap to bit3 below)
+      // 0x20 = wheel left  → Mission Control (Ctrl+Up)
+      // 0x40 = wheel right → Back
       // 0x04 = both pressed (HW combo) → middle click (keep as bit2)
       {
         static bool missionActive = false;
 
-        // Wheel left (0x40) → Mission Control
-        if (rawBtn & 0x40) {
+        // Wheel left (0x20) → Mission Control
+        if (rawBtn & 0x20) {
           if (!missionActive) {
             uint8_t keyReport[8] = {0};
             keyReport[0] = 0x01;  // Left Control
@@ -401,7 +401,7 @@ static void dispatchHidReport(uint8_t ifaceIdx,
             keyInput->notify();
             missionActive = true;
           }
-          rawBtn &= ~0x40;  // Strip from mouse report
+          rawBtn &= ~0x20;  // Strip from mouse report
         } else if (missionActive) {
           uint8_t keyReport[8] = {0};
           keyInput->setValue(keyReport, sizeof(keyReport));
@@ -409,12 +409,12 @@ static void dispatchHidReport(uint8_t ifaceIdx,
           missionActive = false;
         }
 
-        // 0x20 (wheel right) → Back: handled below in btn remap (bit5→bit3)
+        // 0x40 (wheel right) → Back: remap bit6→bit3 below
         // 0x04 (both) → middle click: already bit2, pass through
       }
 
       uint8_t btn = (rawBtn & 0x07);            // bits 0-2: Left, Right, Middle
-      if (rawBtn & 0x20) btn |= 0x08;           // bit 5 → bit 3: Back
+      if (rawBtn & 0x40) btn |= 0x08;           // bit 6 (wheel right) → bit 3: Back
 
       // Accumulate deltas
       accumX += outX;
